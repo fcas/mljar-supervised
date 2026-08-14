@@ -4,7 +4,15 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import shap
+shap_pacakge_available = False
+try:
+    # I'm tired of all shap dependency hell
+    # ugh
+    import shap
+    shap_pacakge_available = True
+except Exception:
+    pass
+
 from sklearn.preprocessing import OneHotEncoder
 
 from supervised.algorithms.registry import (
@@ -23,6 +31,8 @@ import warnings
 class PlotSHAP:
     @staticmethod
     def is_available(algorithm, X_train, y_train, ml_task):
+        if not shap_pacakge_available:
+            return False
         # https://github.com/mljar/mljar-supervised/issues/112 disable for NN
         # https://github.com/mljar/mljar-supervised/issues/114 disable for CatBoost
         if algorithm.algorithm_short_name in ["Baseline", "Neural Network", "CatBoost"]:
@@ -109,13 +119,14 @@ class PlotSHAP:
         classes = None
         if class_names is not None and len(class_names):
             classes = class_names
-
-        shap.summary_plot(
-            shap_values, X_vald, plot_type="bar", show=False, class_names=classes
-        )
-        fig.tight_layout(pad=2.0)
-        fig.savefig(os.path.join(model_file_path, f"{learner_name}_shap_summary.png"))
-        plt.close("all")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            shap.summary_plot(
+                shap_values, X_vald, plot_type="bar", show=False, class_names=classes
+            )
+            fig.tight_layout(pad=2.0)
+            fig.savefig(os.path.join(model_file_path, f"{learner_name}_shap_summary.png"))
+            plt.close("all")
 
         vals = None
         if isinstance(shap_values, list):

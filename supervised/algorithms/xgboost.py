@@ -78,6 +78,7 @@ class XgbAlgorithm(BaseAlgorithm):
         self.early_stopping_rounds = additional.get("early_stopping_rounds", 50)
         self.learner_params = {
             "tree_method": "hist",
+            "device": "cpu",
             "booster": "gbtree",
             "objective": self.params.get("objective"),
             "eval_metric": self.params.get("eval_metric"),
@@ -166,17 +167,22 @@ class XgbAlgorithm(BaseAlgorithm):
         dtrain = xgb.DMatrix(
             X.values if isinstance(X, pd.DataFrame) else X,
             label=y,
-            missing=np.NaN,
+            missing=np.nan,
             weight=sample_weight,
         )
-        dvalidation = xgb.DMatrix(
-            X_validation.values
-            if isinstance(X_validation, pd.DataFrame)
-            else X_validation,
-            label=y_validation,
-            missing=np.NaN,
-            weight=sample_weight_validation,
-        )
+        
+        if X_validation is not None and y_validation is not None:       
+            dvalidation = xgb.DMatrix(
+                X_validation.values
+                if isinstance(X_validation, pd.DataFrame)
+                else X_validation,
+                label=y_validation,
+                missing=np.nan,
+                weight=sample_weight_validation,
+            )
+        else:
+            dvalidation = None
+            
         evals_result = {}
 
         evals = []
@@ -259,7 +265,7 @@ class XgbAlgorithm(BaseAlgorithm):
             raise XgbAlgorithmException("Xgboost model is None")
 
         dtrain = xgb.DMatrix(
-            X.values if isinstance(X, pd.DataFrame) else X, missing=np.NaN
+            X.values if isinstance(X, pd.DataFrame) else X, missing=np.nan
         )
         # xgboost > 2.0.0 version
         if hasattr(self.model, "best_iteration"):
@@ -362,7 +368,7 @@ required_preprocessing = [
 ]
 
 
-class XgbClassifier(XgbAlgorithm, ClassifierMixin):
+class XgbClassifier(ClassifierMixin, XgbAlgorithm):
     pass
 
 
@@ -393,7 +399,7 @@ regression_required_preprocessing = [
 ]
 
 
-class XgbRegressor(XgbAlgorithm, RegressorMixin):
+class XgbRegressor(RegressorMixin, XgbAlgorithm):
     pass
 
 

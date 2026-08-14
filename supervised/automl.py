@@ -2,7 +2,6 @@ import logging
 
 import matplotlib
 
-matplotlib.use("Agg")
 import warnings
 
 warnings.filterwarnings("ignore", message=".*The 'nopython' keyword.*")
@@ -151,11 +150,20 @@ class AutoML(BaseAutoML):
 
             stack_models (boolean): Whether a models stack gets created at the end of the training. Stack level is 1.
 
-            eval_metric (str): The metric to be used in early stopping and to compare models.
+            eval_metric (str or function): The metric to be used in early stopping and to compare models.
 
                 - for binary classification: `logloss`, `auc`, `f1`, `average_precision`, `accuracy` - default is logloss (if left "auto")
                 - for mutliclass classification: `logloss`, `f1`, `accuracy` - default is `logloss` (if left "auto")
                 - for regression: `rmse`, `mse`, `mae`, `r2`, `mape`, `spearman`, `pearson` - default is `rmse` (if left "auto")
+
+                You can also pass a custom Python function directly. The expected interface is:
+
+                `def my_metric(y_true, y_predicted, sample_weight=None): return score`
+
+                The returned value is always minimized. If you want to maximize a metric,
+                for example precision or F1, return its negative value. For classification
+                tasks, `y_predicted` can contain probabilities, so thresholding or `argmax`
+                might be needed inside the custom metric.
 
             validation_strategy (dict): Dictionary with validation type. Right now train/test split and cross-validation are supported.
 
@@ -411,7 +419,7 @@ class AutoML(BaseAutoML):
         sensitive_features: Optional[
             Union[numpy.ndarray, pandas.Series, pandas.DataFrame]
         ] = None,
-    ):
+    ) -> "AutoML":
         """Fit the AutoML model.
 
         Arguments:
@@ -427,9 +435,23 @@ class AutoML(BaseAutoML):
             sensitive_features (pandas.Series or pandas.DataFrame): Sensitive features to learn fair models
 
         Returns:
-            AutoML object: Returns `self`
+            AutoML: Returns `self`.
         """
-        return self._fit(X, y, sample_weight, cv, sensitive_features)
+        try:
+            original_backend = matplotlib.get_backend()
+            matplotlib.use("Agg")
+            return self._fit(X, y, sample_weight, cv, sensitive_features)
+        except Exception as e:
+            raise e
+        finally:
+            matplotlib.use(original_backend)
+            try:
+                if 'inline' in original_backend:
+                    import matplotlib_inline
+                    matplotlib_inline.backend_inline._enable_matplotlib_integration()
+            except:
+                pass
+
 
     def predict(self, X: Union[List, numpy.ndarray, pandas.DataFrame]) -> numpy.ndarray:
         """
@@ -522,6 +544,44 @@ class AutoML(BaseAutoML):
     def report(self, width=900, height=1200):
         return self._report(width, height)
 
+    def report_structured(self, format="markdown", model_name=None):
+        return self._report_structured(format, model_name)
+
+    def app(self, path=None, overwrite=False, title=None, verbose=True):
+        from supervised.apps import generate_app
+
+        return generate_app(
+            self, path=path, overwrite=overwrite, title=title, verbose=verbose
+        )
+
+    def publish_app(
+        self,
+        url=None,
+        path=None,
+        overwrite=False,
+        title=None,
+        open_browser=True,
+        timeout=300,
+        verbose=True,
+    ):
+        from supervised.apps import publish_app_from_automl
+
+        return publish_app_from_automl(
+            self,
+            url=url,
+            path=path,
+            overwrite=overwrite,
+            title=title,
+            open_browser=open_browser,
+            timeout=timeout,
+            verbose=verbose,
+        )
+
+    def local_app(self):
+        from supervised.apps import run_local_app_from_automl
+
+        return run_local_app_from_automl(self)
+
     def need_retrain(
         self,
         X: Union[numpy.ndarray, pandas.DataFrame],
@@ -546,7 +606,7 @@ class AutoML(BaseAutoML):
                 on new data then there is a need to retrain. This value should be set depending on your project needs.
                 Sometimes, 10% is enough, but for some projects, it can be even lower than 1%.
 
-            Returns:
-                boolean: Decides if there is a need to retrain the AutoML.
+        Returns:
+            bool: Decides if there is a need to retrain the AutoML.
         """
         return self._need_retrain(X, y, sample_weight, decrease)

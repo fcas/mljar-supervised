@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 import types
+import uuid
 from abc import ABC
 from copy import deepcopy
 
@@ -25,6 +26,7 @@ from supervised.callbacks.early_stopping import EarlyStopping
 from supervised.callbacks.total_time_constraint import TotalTimeConstraint
 from supervised.ensemble import Ensemble
 from supervised.exceptions import AutoMLException, NotTrainedException
+from supervised.fairness.report import FairnessReport
 from supervised.model_framework import ModelFramework
 from supervised.preprocessing.exclude_missing_target import ExcludeRowsMissingTarget
 # disable EDA
@@ -45,6 +47,14 @@ from supervised.utils.data_validation import (
 from supervised.utils.jsonencoder import MLJSONEncoder
 from supervised.utils.leaderboard_plots import LeaderboardPlots
 from supervised.utils.metric import Metric, UserDefinedEvalMetric
+from supervised.utils.report_structured import (
+    AUTOMATION_CONSOLE_TEXT,
+    AUTOMATION_DISCLOSURE_TEXT,
+    build_compact_view,
+    build_structured_report,
+    save_structured_report,
+    to_markdown,
+)
 from supervised.utils.utils import dump_data, load_data
 
 logger = logging.getLogger(__name__)
@@ -107,6 +117,7 @@ class BaseAutoML(BaseEstimator, ABC):
         self._underprivileged_groups = []
         self._optuna_verbose = True
         self._n_jobs = -1
+        self._id = str(uuid.uuid4())
 
     def _get_tuner_params(
         self, start_random_models, hill_climbing_steps, top_models_to_improve
@@ -130,12 +141,15 @@ class BaseAutoML(BaseEstimator, ABC):
     def load(self, path):
         logger.info("Loading AutoML models ...")
         try:
-            params = json.load(open(os.path.join(path, "params.json")))
+            with open(os.path.join(path, "params.json")) as file:
+                params = json.load(file)
 
             self._model_subpaths = params["saved"]
             self._mode = params.get("mode", self._mode)
             self._ml_task = params.get("ml_task", self._ml_task)
-            self._results_path = params.get("results_path", self._results_path)
+            # The loaded directory is the source of truth. Serialized results_path
+            # can be stale or intentionally rewritten for packaged app bundles.
+            self._results_path = path
             self._total_time_limit = params.get(
                 "total_time_limit", self._total_time_limit
             )
@@ -215,7 +229,8 @@ class BaseAutoML(BaseEstimator, ABC):
                     self._stacked_models += [models_map[stacked_model_name]]
 
             data_info_path = os.path.join(path, "data_info.json")
-            self._data_info = json.load(open(data_info_path))
+            with open(data_info_path, "r") as file:
+                self._data_info = json.load(file)
             self.n_features_in_ = self._data_info["n_features"]
 
             if "n_classes" in self._data_info:
@@ -675,6 +690,7 @@ class BaseAutoML(BaseEstimator, ABC):
             "cols": X.shape[1],
             "target_is_numeric": target_is_numeric,
             "columns_info": columns_and_target_info["columns_info"],
+            "columns_values": self._save_columns_values(X, columns_and_target_info["columns_info"]),
             "target_info": columns_and_target_info["target_info"],
             "n_features": self.n_features_in_,
             "is_sample_weighted": sample_weight is not None,
@@ -689,6 +705,19 @@ class BaseAutoML(BaseEstimator, ABC):
         data_info_path = os.path.join(self._results_path, "data_info.json")
         with open(data_info_path, "w") as fout:
             fout.write(json.dumps(self._data_info, indent=4, cls=MLJSONEncoder))
+
+    def _save_columns_values(self, X, columns_info):
+        values = {}
+        for col, info in columns_info.items():
+            if "categorical" not in info and "text_transform" not in info:
+                continue
+            non_null = X[col].dropna()
+            if non_null.empty:
+                continue
+            unique_values = pd.Series([str(v) for v in pd.unique(non_null)]).tolist()
+            if "few_categories" in info:
+                values[col] = unique_values[:20]
+        return values
 
     def save_progress(self, step=None, generated_params=None):
         if step is not None and generated_params is not None:
@@ -710,7 +739,8 @@ class BaseAutoML(BaseEstimator, ABC):
         fname = os.path.join(self._results_path, "progress.json")
         if not os.path.exists(fname):
             return
-        state = json.load(open(fname, "r"))
+        with open(fname, "r") as file:
+            state = json.load(file)
         self._fit_level = state.get("fit_level", self._fit_level)
         self._all_params = state.get("all_params", self._all_params)
         self._time_ctrl = TimeController.from_json(state.get("time_controller"))
@@ -734,7 +764,7 @@ class BaseAutoML(BaseEstimator, ABC):
         # If Inputs are not pandas dataframes use scikit-learn validation for X array
         if not isinstance(X, pd.DataFrame):
             # Validate X as array
-            X = check_array(X, ensure_2d=False, force_all_finite=False)
+            X = check_array(X, ensure_2d=False, ensure_all_finite=False)
             # Force X to be 2D
             X = np.atleast_2d(X)
             # Create Pandas dataframe from np.arrays, columns get names with the schema: feature_{index}
@@ -800,7 +830,7 @@ class BaseAutoML(BaseEstimator, ABC):
             sensitive_features.reset_index(drop=True, inplace=True)
 
             for col in sensitive_features.columns:
-                if not sensitive_features[col].dtype.name in ["category", "object"]:
+                if pd.api.types.is_numeric_dtype(sensitive_features[col].dtype):
                     self.verbose_print("Sensitive features should be categorical")
                     self.verbose_print(
                         f"Apply automatic binarization for feature {col}"
@@ -1039,6 +1069,7 @@ class BaseAutoML(BaseEstimator, ABC):
                 f"The task is {self._ml_task} with evaluation metric {self._eval_metric}"
             )
             self.verbose_print(f"AutoML will use algorithms: {self._algorithms}")
+            self.verbose_print(AUTOMATION_CONSOLE_TEXT)
             if self._stack_models:
                 self.verbose_print("AutoML will stack models")
             if self._train_ensemble:
@@ -1372,7 +1403,19 @@ class BaseAutoML(BaseEstimator, ABC):
 
             with open(os.path.join(self._results_path, "README.md"), "w") as fout:
                 fout.write(f"# AutoML Leaderboard\n\n")
+                fout.write(f"> {AUTOMATION_DISCLOSURE_TEXT}\n\n")
                 fout.write(tabulate(ldb.values, ldb.columns, tablefmt="pipe"))
+                if self._fairness_metric is not None and self._best_model is not None:
+                    additional_metrics = self._best_model.get_additional_metrics() or {}
+                    fairness_metrics = additional_metrics.get("fairness_metrics")
+                    certificate_info = FairnessReport.certificate_info(
+                        self._best_model.get_name(),
+                        self._ml_task,
+                        fairness_metrics,
+                        self._best_model.get_worst_fairness(),
+                        self._best_model.is_fair(),
+                    )
+                    FairnessReport.write_certificate_section(fout, certificate_info)
                 LeaderboardPlots.compute(
                     ldb, self._results_path, fout, self._fairness_threshold
                 )
@@ -1382,15 +1425,17 @@ class BaseAutoML(BaseEstimator, ABC):
 
     def get_ensemble_models(self, ensemble_name="Ensemble"):
         try:
-            params = json.load(
-                open(os.path.join(self.results_path, ensemble_name, "ensemble.json"))
-            )
+            results_path = self._get_results_path()
+            with open(os.path.join(results_path, ensemble_name, "ensemble.json")) as file:
+                params = json.load(file)
             return [m["model"] for m in params["selected_models"]]
         except Exception as e:
             return []
 
     def models_needed_on_predict(self, required_model_name):
-        params = json.load(open(os.path.join(self.results_path, "params.json")))
+        results_path = self._get_results_path()
+        with open(os.path.join(results_path, "params.json")) as file:
+            params = json.load(file)
         saved_models = params.get("saved", [])
         stacked_models = params.get("stacked", [])
 
@@ -2290,10 +2335,10 @@ class BaseAutoML(BaseEstimator, ABC):
     color: white;
 }}
 
-body {{
+.mljar-automl-report {{
     font-family: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
     background-color: rgba(236, 243, 249, 0.15);
-}}
+
 
 h1 {{
     color: #004666;
@@ -2327,7 +2372,7 @@ a:hover {{
     cursor: pointer;
     color: #0099CC;
 }}
-
+}}
 
 """
 
@@ -2377,26 +2422,26 @@ a:hover {{
                 content_html = "\n".join(new_content)
 
         # change links
-        if page_type == "automl-report-main":
+        if page_type == f"automl-report-main-{self._id}":
             for f in os.listdir(dir_path):
                 if os.path.exists(os.path.join(dir_path, f, "README.md")):
                     old = f'href="{f}/README.html"'
-                    new = f"onclick=\"toggleShow('{f}');toggleShow('automl-report-main')\" "
+                    new = f"onclick=\"toggleShow('{f}-{self._id}');toggleShow('automl-report-main-{self._id}')\" "
                     content_html = content_html.replace(old, new)
 
         # other links
         if me is not None:
             old = 'href="../README.html"'
-            new = f"onclick=\"toggleShow('{me}');toggleShow('automl-report-main')\" "
+            new = f"onclick=\"toggleShow('{me}-{self._id}');toggleShow('automl-report-main-{self._id}')\" "
             content_html = content_html.replace(old, new)
 
         beginning = ""
 
-        if page_type == "automl-report-main":
+        if page_type == f"automl-report-main-{self._id}":
             beginning += """<img src="https://raw.githubusercontent.com/mljar/visual-identity/main/media/mljar_AutomatedML.png" style="height:128px; margin-left: auto;
 margin-right: auto;display: block;"/>\n\n"""
             if os.path.exists(os.path.join(self._results_path, "optuna/README.md")):
-                beginning += "<h2><a onclick=\"toggleShow('optuna');toggleShow('automl-report-main')\" >&#187; Optuna Params Tuning Report</a></h2>"
+                beginning += f"<h2><a onclick=\"toggleShow('optuna');toggleShow('automl-report-main-{self._id}')\" >&#187; Optuna Params Tuning Report</a></h2>"
 
         content_html = beginning + content_html
 
@@ -2421,8 +2466,8 @@ margin-right: auto;display: block;"/>\n\n"""
         body = ""
         fname = os.path.join(self._results_path, "README.md")
         body += (
-            '<div id="automl-report-main">\n'
-            + self._md_to_html(fname, "automl-report-main", self._results_path)
+            f'<div id="automl-report-main-{self._id}">\n'
+            + self._md_to_html(fname, f"automl-report-main-{self._id}", self._results_path)
             + "\n\n</div>\n\n"
         )
 
@@ -2430,7 +2475,7 @@ margin-right: auto;display: block;"/>\n\n"""
             fname = os.path.join(self._results_path, f, "README.md")
             if os.path.exists(fname):
                 body += (
-                    f'<div id="{f}" style="display: none">\n'
+                    f'<div id="{f}-{self._id}" style="display: none">\n'
                     + self._md_to_html(
                         fname, "sub", os.path.join(self._results_path, f), f
                     )
@@ -2459,7 +2504,9 @@ margin-right: auto;display: block;"/>\n\n"""
     </style>
 </head>
 <body>
+    <div class="mljar-automl-report-{self._id}">
     {body}
+    <div>
 </body>
 </html>
 """
@@ -2467,6 +2514,39 @@ margin-right: auto;display: block;"/>\n\n"""
             fout.write(report_content)
 
         return self._show_report(main_readme_html, width, height)
+
+    def _report_structured(self, format="markdown", model_name=None):
+        self._results_path = self._get_results_path()
+        if self._fit_level != "finished":
+            self.load(self._results_path)
+        elif self._models is None or len(self._models) == 0:
+            # Handle objects where fit() returned early because results already exist.
+            # In that case, fit_level can be "finished" but models might not be loaded.
+            self.load(self._results_path)
+
+        if self._models is None or len(self._models) == 0:
+            raise AutoMLException(
+                "This model has not been fitted yet. Please call `fit()` first."
+            )
+
+        if format not in ["markdown", "dict", "json"]:
+            raise ValueError(
+                f"Wrong format '{format}'. Allowed formats are: markdown, dict, json."
+            )
+
+        payload = build_structured_report(self)
+        save_structured_report(payload, self._results_path)
+
+        try:
+            output_payload = build_compact_view(payload, model_name)
+        except ValueError as e:
+            raise AutoMLException(str(e))
+
+        if format == "dict":
+            return output_payload
+        if format == "json":
+            return json.dumps(output_payload, indent=4)
+        return to_markdown(output_payload, model_name)
 
     def _need_retrain(self, X, y, sample_weight, decrease):
         metric = self._best_model.get_metric()
